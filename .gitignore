@@ -1,0 +1,69 @@
+# ---- Terraform / OpenTofu state & cache ----
+# Build/provider caches and local state must NEVER be committed.
+.terraform/
+.terragrunt-cache/
+.terragrunt-stack/
+terraform.tfstate
+terraform.tfstate.*
+*.tfplan
+*.tfplan.json
+crash.log
+*.log
+
+# NOTE: module-level `.terraform.lock.hcl` files are intentionally NOT ignored.
+# They pin provider versions and should be committed for reproducible CI builds.
+# (Only the copies inside `.terraform/` and `.terragrunt-cache/` are excluded above.)
+
+# ---- Local secrets & variable overrides (may contain real values) ----
+*.tfvars
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+.terraformrc
+terraform.rc
+.env
+.env.*
+!.env.example
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*.iml
+.DS_Store
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+.pytest_cache/
+.cache/
+
+# ---- Node / Helm ----
+node_modules/
+charts/*/charts/
+*.tgz
+
+# ---- Local Kubernetes config ----
+kubeconfig*
+
+# ---- Misc tooling output ----
+.lavish/
+*.tmp
+*.bak
+*.retry
+
+# ---- Lambda / layer build output ----
+modules/monitoring-lambda/_build/
+
+# ---- Local-only learning reference (not committed) ----
+# HANDOFF.md is a personal notes file for reviewing what we've learned; keep it
+# on disk but out of version control.
+HANDOFF.md

@@ -1,0 +1,20 @@
+# Pre-commit hooks for the EKS platform.
+# Install once:  pip install pre-commit && pre-commit install
+# Bump hook versions:  pre-commit autoupdate
+#
+# These run on every `git commit` (locally) and keep the source tree clean:
+#   - terraform fmt       : canonical formatting of *.tf
+#   - terraform validate  : internal consistency of the configuration
+#   - terraform tflint    : lint rules (requires `tflint` on PATH)
+#   - terraform tfsec     : security scan (requires `tfsec` on PATH)
+#
+
+repos:
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.96.0
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+      - id: terraform_tflint
+      - id: terraform_tfsec
+      # - id: terraform_docs   # enable once modules have BEGIN/END_TF_DOCS markers
