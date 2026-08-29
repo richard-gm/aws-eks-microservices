@@ -1,195 +1,232 @@
-# aws-monitoring-scripts
+# EKS Platform (Terraform + Terragrunt)
 
-Python monitoring scripts that run inside a single AWS Lambda and push metrics
-into an existing Grafana/Prometheus stack (the
-[grafana-stack-aws](https://github.com/richard-gm/grafana-stack-aws) repo) via
-its **Prometheus Pushgateway**.
+Production-style **Amazon EKS** platform defined in Terraform and orchestrated by
+Terragrunt across `dev` and `prod`, isolated in separate AWS accounts / VPCs.
 
-One Lambda, many triggers:
+---
 
-```
-                         ┌─────────────────────────────┐
-  EventBridge (cron) ───▶│                             │   download
-  EventBridge (cron) ───▶│   monitoring Lambda (VPC)   │──▶ s3://scripts/<name>.py
-  EventBridge (cron) ───▶│                             │        │
-                         └──────────────┬──────────────┘        │ run as subprocess
-                                        │                       ▼
-                                        │              script uses monitoring_sdk
-                                        │              (Lambda LAYER) to push
-                                        └────────────▶ Prometheus Pushgateway :9091
-                                                          (scraped by Prometheus → Grafana)
-```
+## What you are looking at (big picture)
 
-* **Single Lambda** dispatches by the `script` key in the EventBridge event.
-* **Multiple EventBridge schedule rules** (cron/rate) each invoke the same
-  Lambda with a different `{ "script": "...", "job": "..." }` payload.
-* **Scripts live in `monitoring-scripts/`** and are uploaded to S3 by the GitHub
-  Action on merge to `develop`/`main`. Adding a monitor = add a file + add one
-  entry to `monitoring_jobs` — **no Lambda redeploy**.
-* **Shared `monitoring_sdk` layer** (stdlib-only Prometheus Pushgateway client)
-  is available to every script.
+```mermaid
+flowchart TD
+    subgraph AWS["AWS Account (per environment)"]
+        VPC["VPC\n10.0.0.0/16 (dev) / 10.1.0.0/16 (prod)"]
+        subgraph Private["Private Subnets (x3 AZs)"]
+            EKS["EKS Control Plane"]
+            KARP["Karpenter\nprovisions EC2 nodes on demand"]
+            ARGO["ArgoCD\nGitOps controller"]
+        end
+        subgraph Public["Public Subnets (x3 AZs)"]
+            NAT["NAT Gateways"]
+            ALB["Load Balancers"]
+        end
+    end
 
-## Repository layout
+    S3[("S3 Bucket (versioned)\nTerraform State + native lock")]
+    GIT["Git Repo\ncharts/ + argocd/"]
 
-```
-aws-monitoring-scripts/
-├── .github/workflows/terraform.yml   # OIDC → terraform apply → sync scripts to S3
-├── environments/
-│   ├── nonprod/                      # terraform.tfvars with your account/VPC values
-│   └── prod/
-├── modules/
-│   ├── github-oidc/                  # GitHub OIDC IAM role (reuses grafana-stack provider)
-│   └── monitoring-lambda/            # Lambda + layer + S3 bucket + EventBridge rules
-├── src/
-│   ├── lambda_handler.py             # dispatcher
-│   └── monitoring_sdk/              # shared layer package
-└── monitoring-scripts/              # <-- your monitors; uploaded to S3 by CI
-    ├── check_rds_snapshots.py
-    └── check_s3_lifecycle.py
+    TG["Terragrunt\nrun-all apply"] -->|creates| VPC
+    TG -->|stores state + locks in| S3
+    ARGO -->|syncs helm charts from| GIT
+    KARP -->|launches EC2 into| Private
 ```
 
-## Wiring to the grafana-stack-aws deployment
+---
 
-Fill these in `environments/<env>/terraform.tfvars` using outputs from the
-grafana-stack-aws deployment:
+## Prerequisites
 
-| tfvars key                     | Source (grafana-stack-aws output)                              |
-|--------------------------------|----------------------------------------------------------------|
-| `vpc_id`                       | `module.vpc.vpc_id`                                             |
-| `private_subnet_ids`           | `module.vpc.private_subnet_ids`                                |
-| `pushgateway_security_group_id`| `module.ecs.ecs_security_group_id` (SG protecting Pushgateway) |
-| `pushgateway_url`              | `http://pushgateway.<service_discovery_namespace_name>:9091`   |
+| Tool | Why | Install |
+|------|-----|---------|
+| `aws` CLI | authenticate to AWS | `brew install awscli` |
+| `terraform` | describe infrastructure | `brew install terraform` |
+| `terragrunt` | DRY orchestration | `brew install terragrunt` |
+| `kubectl` | talk to the cluster | `brew install kubectl` |
+| `helm` | package Kubernetes apps | `brew install helm` |
 
-> The module creates its **own** Lambda security group and adds an ingress rule
-> to the Pushgateway SG (`pushgateway_security_group_id`) allowing `:9091` from
-> the Lambda SG. So you no longer reuse the ECS SG directly for the Lambda — you
-> just point `pushgateway_security_group_id` at it. The namespace name is the
-> `service_discovery_namespace_name` output of the `ecs` module.
->
-> **Network prerequisite:** the private subnets must have a route to the internet
-> (NAT gateway) — the Lambda downloads scripts from S3 and calls AWS APIs, both
-> over the public endpoints. The grafana-stack-aws VPC has a NAT gateway.
+Authenticate with AWS (SSO or a profile) so Terragrunt can assume the
+environment's IAM role.
 
-## Adding a new monitor
+---
 
-1. Drop a script in `monitoring-scripts/`, e.g. `check_elb_health.py`.
-   It can `import boto3` (Lambda runtime) and `from monitoring_sdk import Pushgateway, Metric`.
-2. Add an entry to `monitoring_jobs` in `environments/<env>/terraform.tfvars`:
+## Directory layout
 
-   ```hcl
-   monitoring_jobs = [
-     {
-       name        = "elb-health"
-       script      = "check_elb_health"
-       job         = "elb-health"
-       schedule    = "cron(0/15 * * * ? *)"  # every 15 min
-       description = "ALB target health"
-     },
-   ]
-   ```
-3. Merge to `develop` (nonprod) or `main` (prod). Terraform creates the
-   EventBridge rule and the Action uploads the new script to S3.
+```mermaid
+flowchart LR
+    Root["./"] --> RG["terragrunt.hcl\n(remote state + aws provider)"]
+    Root --> Env["environments/dev & prod"]
+    Root --> Mods["modules/* (reusable Terraform)"]
+    Root --> Boot["bootstrap/remote-state\n(creates the state bucket)"]
+    Root --> Charts["charts/sample\n(helm app ArgoCD deploys)"]
+    Root --> Apps["argocd/applications\n(GitOps manifests)"]
 
-## Writing a script
-
-```python
-import os
-from monitoring_sdk import Pushgateway, Metric
-
-def main():
-    g = Metric("my_gauge", "gauge", "example")
-    g.add(42, {"label": "a"})
-    Pushgateway(
-        os.environ["PUSHGATEWAY_URL"],
-        job=os.environ.get("JOB", "my-job"),
-    ).push([g])
-
-if __name__ == "__main__":
-    main()
+    Env -->|vpc| Mods
+    Env -->|eks| Mods
+    Env -->|security-groups| Mods
+    Env -->|karpenter| Mods
+    Env -->|argocd| Mods
 ```
 
-Environment provided to every script: `PUSHGATEWAY_URL`, `JOB`, `SCRIPT`,
-plus the normal Lambda/AWS env (`AWS_REGION`, `AWS_DEFAULT_REGION`, …).
+- **`modules/`** — reusable Terraform "blueprints". They know *how* to build
+  something (e.g. a VPC) but not *where* or *with what names* — those come from
+  the environment.
+- **`environments/<env>/<unit>/terragrunt.hcl`** — the "wiring". Each file points
+  at a module (`source`) and supplies the inputs (names, CIDRs, account ids) plus
+  the dependencies between units.
+- **`bootstrap/remote-state`** — a one-time stack that creates the **versioned
+  S3 bucket** (with native state locking) that every other stack stores its state
+  in. No DynamoDB table is created.
 
-## IAM for the monitors
+---
 
-The Lambda execution role gets a default **read-only** policy
-(`lambda_policy_json` in `modules/monitoring-lambda/variables.tf`) covering
-common `Describe*`/`List*`/`Get*` actions. If a monitor needs a permission not in
-the default (e.g. `secretsmanager:GetSecretValue`, `kms:Decrypt`), override
-`lambda_policy_json` in `environments/<env>/terraform.tfvars`:
+## How to deploy (step by step)
 
-```hcl
-lambda_policy_json = jsonencode({
-  Version = "2012-10-17"
-  Statement = [{
-    Effect   = "Allow"
-    Action   = ["rds:Describe*", "secretsmanager:GetSecretValue"]
-    Resource = "*"
-  }]
-})
-```
+### 0. One-time: create the state backend
 
-## Heartbeat, up-signal & alarms
-
-To avoid the classic "last good value looks healthy" trap, the handler pushes two
-metrics on **every** run (success or failure), even when the script itself
-produces nothing:
-
-* `monitoring_run_status{script,job,status}` — `1` if the run succeeded, `0` otherwise.
-* `monitoring_run_timestamp_seconds{script,job}` — unix time of the last run.
-
-Build a Grafana panel that alerts when `monitoring_run_status == 0`, or when
-`monitoring_run_timestamp_seconds` is older than your longest schedule.
-
-Three CloudWatch alarms are created per environment (in
-`modules/monitoring-lambda/alarms.tf`):
-
-* `…-monitoring-errors` — Lambda `Errors > 0`
-* `…-monitoring-throttles` — Lambda `Throttles > 0`
-* `…-monitoring-no-invocations` — `Invocations == 0` over `missed_run_period`
-  (default 24h), treating missing data as **breaching** (catches a dead
-  EventBridge schedule)
-
-Set `alarm_actions = ["arn:aws:sns:…:my-topic"]` in tfvars to route alarms to SNS.
-
-## Grafana-side requirements (must verify in the grafana-stack-aws account)
-
-These live **outside this repo** (the Prometheus config is stored in an S3 bucket
-in the grafana deployment); without them no metrics appear:
-
-1. Prometheus must have a scrape job targeting the Pushgateway
-   (`pushgateway.<namespace>:9091`).
-2. That scrape job must set **`honor_labels: true`**, otherwise your per-monitor
-   `job` labels are overwritten by the pushgateway scrape job name.
-3. The GitHub OIDC provider from grafana-stack-aws must already exist (this repo
-   references it via a data source). Deploy grafana-stack-aws first.
-
-## CI/CD
-
-The GitHub Action (`terraform.yml`) mirrors the grafana-stack-aws workflow:
-
-* `pull_request` → `terraform plan`
-* `push` to `develop`/`main` → `terraform apply` (env from branch) **then**
-  `aws s3 sync monitoring-scripts/ s3://monitoring-scripts-<account>-<env>/`
-
-Required GitHub repo variables:
-
-* `AWS_ACCOUNT_ID_NONPROD`
-* `AWS_ACCOUNT_ID_PROD`
-
-The OIDC role `aws-monitoring-github-actions-<env>` is created by Terraform.
-It trusts the **existing** GitHub OIDC provider created by grafana-stack-aws.
-
-## Bootstrap
+Creates the versioned S3 bucket (state + native locking) all other stacks use.
+Run once per AWS account (local backend, self-contained):
 
 ```bash
-# one-time: create the Terraform state bucket (versioned)
-aws s3 mb s3://aws-monitoring-terraform-state-nonprod --region us-east-1
-aws s3api put-bucket-versioning --bucket aws-monitoring-terraform-state-nonprod \
-  --versioning-configuration Status=Enabled
-
-cd environments/nonprod
-terraform init
-terraform apply
+# The account id is injected via env var (never hardcoded in the file):
+export AWS_ACCOUNT_ID=<your-nonprod-account-id>
+terragrunt apply --terragrunt-working-dir bootstrap/remote-state
 ```
+
+> `bootstrap/remote-state/terragrunt.hcl` reads `AWS_ACCOUNT_ID` via `get_env`;
+> the created bucket `eks-tf-state-${AWS_ACCOUNT_ID}` matches the environments'
+> `remote_state` bucket.
+
+### 1. Deploy an environment
+
+Apply all units in dependency order:
+
+```bash
+# Plan first (safe, shows what will change)
+terragrunt run-all plan  --terragrunt-working-dir environments/dev
+
+# Apply when you are happy
+terragrunt run-all apply --terragrunt-working-dir environments/dev
+```
+
+Terragrunt automatically orders units using the `dependency` blocks
+(`vpc` → `eks` → `security-groups` / `karpenter` / `argocd`).
+
+### 2. Talk to the cluster
+
+```bash
+aws eks update-kubeconfig --name eks-dev --region us-east-1
+kubectl get nodes          # Karpenter will have launched nodes
+kubectl get pods -n argocd # ArgoCD is running
+```
+
+### 3. Watch ArgoCD deploy the sample app
+
+ArgoCD reads `argocd/applications/sample-application.yaml` and deploys the Helm
+chart in `charts/sample` into the `sample` namespace. Open the ArgoCD UI
+(LoadBalancer service in `argocd` namespace) and you will see the `sample` app
+sync.
+
+---
+
+## Environments: dev vs prod
+
+| | dev | prod |
+|---|-----|------|
+| Account (via `AWS_ACCOUNT_ID`) | nonprod account | prod account |
+| VPC CIDR | `10.0.0.0/16` | `10.1.0.0/16` |
+| API endpoint CIDRs | `0.0.0.0/0` (sandbox) | tighten to VPN (TODO) |
+| ArgoCD service | LoadBalancer | tighten to ingress (TODO) |
+| Git branch (`git_repo_branch`) | `develop` | `main` |
+
+The two environments are kept in sync by sharing the same modules; only the
+`inputs`/`locals` in `environments/<env>/terragrunt.hcl` differ. Account IDs and
+repo URLs are **never committed** — they come from `AWS_ACCOUNT_ID` / `GIT_REPO_URL`
+env vars (set in GitHub or exported locally).
+
+### GitOps promotion model
+
+One repository, differentiated by **revision** (branch/tag) — not by a different
+repo URL:
+
+```mermaid
+flowchart LR
+  Push["git push"] -->|to develop| D["branch: develop"]
+  Push -->|PR merge to main| M["branch: main (or tag)"]
+  D -->|ArgoCD dev syncs| EKSd[(eks-dev)]
+  M -->|ArgoCD prod syncs| EKSp[(eks-prod)]
+```
+
+Dev tracks the `develop` branch (fast iteration); prod tracks `main`/a release tag
+(immutable promotion). Both point at the same `git_repo_url`.
+
+---
+
+## Things you MUST change before going live
+
+1. **`AWS_ACCOUNT_ID`** — not stored in any file. Set it as a GitHub repo `var`
+   (`AWS_ACCOUNT_ID_NONPROD` / `AWS_ACCOUNT_ID_PROD`) and export it locally
+   (`export AWS_ACCOUNT_ID=...`) before running bootstrap/terragrunt.
+2. **`GIT_REPO_URL`** — set as a GitHub repo `var` (or export locally) so ArgoCD
+   points at *your* repo. Dev and prod use the **same** repo, differing by branch.
+3. **API endpoint CIDRs** — `0.0.0.0/0` is fine for a sandbox, never for prod.
+4. **Karpenter `NodePool` limits** (CPU cap, spot vs on-demand) in
+   `modules/karpenter/main.tf`.
+5. IAM roles assume the OIDC provider automatically; if CI uses OIDC, wire the
+   GitHub Actions role ARNs in `.github/workflows/terragrunt.yml`.
+
+---
+
+## Quality gates (how bad code never reaches AWS)
+
+Every change is checked locally and in CI before it can deploy:
+
+```mermaid
+flowchart LR
+  Dev["Developer"] -->|export AWS_ACCOUNT_ID| PC["git commit"]
+  subgraph Local["pre-commit-terraform (.pre-commit-config.yaml)"]
+    F["terraform fmt"]
+    V["terraform validate"]
+    L["tflint"]
+    S["tfsec"]
+  end
+  PC --> Local
+  Local -->|git push| CI["CI (terragrunt.yml)"]
+  subgraph Remote["CI checks"]
+    FC["terraform fmt -check"]
+    HC["terragrunt hcl format --check"]
+    DC["terraform-docs --check"]
+    RA["terragrunt run-all plan/apply"]
+  end
+  CI --> Remote
+  RA -->|per unit: before_hook| Hook["terraform validate"]
+  Hook -->|state + native lock| S3[("S3 (versioned)")]
+  RA --> AWS[(AWS: VPC / EKS / ...)]
+```
+
+- **Local:** `.pre-commit-config.yaml` runs `terraform fmt`, `terraform validate`,
+  `tflint`, and `tfsec` on every commit (install once with `pre-commit install`).
+- **CI:** enforces formatting (`terraform fmt -check`, `terragrunt hcl format --check`)
+  and docs, then runs `terragrunt run-all plan/apply`.
+- **Per unit:** the root `terragrunt.hcl` adds a `before_hook "terraform_validate"`
+  so an invalid config fails before a real plan.
+- `fmt` / `terraform-docs` are intentionally **not** Terragrunt hooks — those run
+  in the cache dir, not your `modules/*` source.
+
+See `AGENTS.md` for the full rule set the AI harness follows.
+
+---
+
+## Module map (where to read next)
+
+```mermaid
+flowchart TD
+    VPC["modules/vpc\n→ README"] --> EKS["modules/eks\n→ README"]
+    EKS --> SG["modules/security-groups\n→ README"]
+    EKS --> KARP["modules/karpenter\n→ README"]
+    EKS --> ARGO["modules/argocd\n→ README"]
+    KARP -->|scales| Nodes["EC2 Worker Nodes"]
+    ARGO -->|deploys| Sample["charts/sample"]
+```
+
+Each `modules/<name>/README.md` explains that piece in detail. Start with
+[modules/eks/README.md](modules/eks/README.md) if you want to understand the
+cluster itself.
