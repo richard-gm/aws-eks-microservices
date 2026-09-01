@@ -52,13 +52,14 @@ environment's IAM role.
 
 ```mermaid
 flowchart LR
-    Root["./"] --> RG["terragrunt.hcl\n(remote state + aws provider)"]
+    Root["./"] --> RH["root.hcl\n(remote state + quality gates)"]
     Root --> Env["environments/dev & prod"]
     Root --> Mods["modules/* (reusable Terraform)"]
     Root --> Boot["bootstrap/remote-state\n(creates the state bucket)"]
     Root --> Charts["charts/sample\n(helm app ArgoCD deploys)"]
     Root --> Apps["argocd/applications\n(GitOps manifests)"]
 
+    Env --> EH["env.hcl\n(locals + AWS provider)"]
     Env -->|vpc| Mods
     Env -->|eks| Mods
     Env -->|security-groups| Mods
@@ -69,9 +70,16 @@ flowchart LR
 - **`modules/`** — reusable Terraform "blueprints". They know *how* to build
   something (e.g. a VPC) but not *where* or *with what names* — those come from
   the environment.
-- **`environments/<env>/<unit>/terragrunt.hcl`** — the "wiring". Each file points
-  at a module (`source`) and supplies the inputs (names, CIDRs, account ids) plus
-  the dependencies between units.
+- **`environments/<env>/<unit>/terragrunt.hcl`** — the "wiring". Each file merges
+  two flat partials via named includes — `root.hcl` (remote state + quality gates)
+  and `<env>/env.hcl` (`expose = true`, so the env's `locals` are referenceable) —
+  then points at a module (`source`) and supplies the inputs plus the dependencies
+  between units. Terragrunt allows only one level of includes, so the two partials
+  never include each other; only leaf units hold `include` blocks.
+- **`root.hcl` + `environments/<env>/env.hcl`** — the two shared partials:
+  `root.hcl` holds account-global blocks (S3 remote state with native locking) and
+  `env.hcl` holds the per-environment values (CIDRs, cluster version, git branch)
+  plus this environment's AWS provider (`generate`).
 - **`bootstrap/remote-state`** — a one-time stack that creates the **versioned
   S3 bucket** (with native state locking) that every other stack stores its state
   in. No DynamoDB table is created.
@@ -138,9 +146,10 @@ sync.
 | Git branch (`git_repo_branch`) | `develop` | `main` |
 
 The two environments are kept in sync by sharing the same modules; only the
-`inputs`/`locals` in `environments/<env>/terragrunt.hcl` differ. Account IDs and
-repo URLs are **never committed** — they come from `AWS_ACCOUNT_ID` / `GIT_REPO_URL`
-env vars (set in GitHub or exported locally).
+`locals` in `environments/<env>/env.hcl` differ (the units reference them via the
+exposed `include "env"`). Account IDs and repo URLs are **never committed** — they
+come from `AWS_ACCOUNT_ID` / `GIT_REPO_URL` env vars (set in GitHub or exported
+locally).
 
 ### GitOps promotion model
 
@@ -206,7 +215,7 @@ flowchart LR
   `tflint`, and `tfsec` on every commit (install once with `pre-commit install`).
 - **CI:** enforces formatting (`terraform fmt -check`, `terragrunt hcl format --check`)
   and docs, then runs `terragrunt run-all plan/apply`.
-- **Per unit:** the root `terragrunt.hcl` adds a `before_hook "terraform_validate"`
+- **Per unit:** `root.hcl` adds a `before_hook "terraform_validate"`
   so an invalid config fails before a real plan.
 - `fmt` / `terraform-docs` are intentionally **not** Terragrunt hooks — those run
   in the cache dir, not your `modules/*` source.

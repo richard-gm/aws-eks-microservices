@@ -1,5 +1,10 @@
-include {
-  path = find_in_parent_folders()
+include "root" {
+  path = find_in_parent_folders("root.hcl")
+}
+
+include "env" {
+  path   = find_in_parent_folders("env.hcl")
+  expose = true
 }
 
 terraform {
@@ -25,6 +30,6 @@ inputs = {
   allowed_api_cidrs         = ["0.0.0.0/0"] # dev-only: open API access. Tighten for prod.
   vpc_cidr_block            = dependency.vpc.outputs.vpc_cidr_block
   tags = {
-    Environment = local.env
+    Environment = include.env.locals.env
   }
 }

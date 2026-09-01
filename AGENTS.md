@@ -9,12 +9,18 @@ they were decided deliberately — do not "simplify" them away.
 
 - `modules/*` = the **source of truth**: real Terraform code, written once (DRY).
 - `environments/<env>/*/terragrunt.hcl` = thin **units**. Each unit only:
-  - `include { path = find_in_parent_folders() }` (inherits remote_state + provider)
+  - `include "root" { path = find_in_parent_folders("root.hcl") }` (remote state + quality gates)
+  - `include "env" { path = find_in_parent_folders("env.hcl"); expose = true }` (env `locals`, here referenced as `include.env.locals.*`)
   - `terraform { source = "../../../modules/<x>" }` (points at the shared module)
   - `inputs = { ... }` (the env-specific arguments)
   - Units contain **no module code**. dev and prod share the same modules and differ
     only by `inputs`/`locals`. Do not copy a module under `environments/`.
-- Root `terragrunt.hcl` = shared `remote_state` + AWS provider, inherited everywhere.
+- `root.hcl` = account-global partial: S3 `remote_state` (native locking) + quality-gate hooks.
+  `environments/<env>/env.hcl` = env partial: the env-specific `locals` + the AWS
+  provider `generate` for that environment.
+- **Terragrunt allows only ONE level of includes**, so the two partials are flat
+  (neither includes the other) and only leaf units hold `include` blocks. Never
+  add an `include` to `root.hcl` or `env.hcl`, and never chain includes 3 deep.
 
 ## Hard rules
 

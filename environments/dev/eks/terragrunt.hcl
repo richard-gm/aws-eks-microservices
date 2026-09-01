@@ -1,5 +1,10 @@
-include {
-  path = find_in_parent_folders()
+include "root" {
+  path = find_in_parent_folders("root.hcl")
+}
+
+include "env" {
+  path   = find_in_parent_folders("env.hcl")
+  expose = true
 }
 
 terraform {
@@ -13,13 +18,13 @@ dependency "vpc" {
 }
 
 inputs = {
-  cluster_name                         = local.cluster_name
-  cluster_version                      = local.cluster_version
+  cluster_name                         = include.env.locals.cluster_name
+  cluster_version                      = include.env.locals.cluster_version
   vpc_id                               = dependency.vpc.outputs.vpc_id
   private_subnet_ids                   = dependency.vpc.outputs.private_subnets
   public_subnet_ids                    = dependency.vpc.outputs.public_subnets
   cluster_endpoint_public_access_cidrs = ["0.0.0.0/0"] # dev-only open API. Restrict in prod.
   tags = {
-    Environment = local.env
+    Environment = include.env.locals.env
   }
 }

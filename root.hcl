@@ -1,13 +1,19 @@
-# Root Terragrunt config: shared remote_state (S3 native locking) and AWS
-# provider, inherited by every unit via include. Env-specific values are
-# injected through locals from environments/<env>/terragrunt.hcl.
+# Root Terragrunt partial: shared remote_state (S3 native locking) and quality
+# gates, inherited by every leaf unit via `include "root"`.
+#
+# Deliberately a *partial* — it defines no `inputs` and no `terraform.source`,
+# so including it only merges the shared blocks below into each unit.
+#
+# Per-env values (region, env, CIDRs, cluster settings, ...) live in
+# environments/<env>/env.hcl and are pulled into units with a second
+# `include "env"`. Terragrunt allows only ONE level of includes, so the
+# hierarchy is two flat partials (root.hcl + env.hcl) merged by named
+# includes at each leaf — no config includes another config that itself
+# includes a third.
 
-# Defaults here are overridden by environments/<env>/terragrunt.hcl via
-# try(local.x, default) — that is how per-env values flow in.
 locals {
-  aws_region = try(local.aws_region, "us-east-1")
-  account_id = try(local.account_id, "")
-  env        = try(local.env, "dev")
+  aws_region = get_env("AWS_REGION", "us-east-1")
+  account_id = get_env("AWS_ACCOUNT_ID", "")
 
   # One state bucket per AWS account.
   state_bucket = "eks-tf-state-${local.account_id}"
@@ -32,37 +38,6 @@ remote_state {
     use_lockfile = true # native S3 locking, no DynamoDB
     encrypt      = true
   }
-}
-
-# Generate the AWS provider once and share it across all units. k8s/helm
-# providers are generated per-unit (karpenter, argocd) from the live cluster.
-generate "provider_aws" {
-  path      = "provider_aws.tf"
-  if_exists = "overwrite_terragrunt"
-  contents  = <<-EOF
-terraform {
-  required_version = ">= 1.10.0"   # native S3 locking needs >= 1.10
-
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
-
-provider "aws" {
-  region = "${local.aws_region}"
-
-  default_tags {
-    tags = {
-      ManagedBy   = "terraform"
-      Project     = "eks-platform"
-      Environment = "${local.env}"
-    }
-  }
-}
-EOF
 }
 
 # --- Quality gates (hooks) -----------------------------------------------------
